@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+
+from typing import Optional
+import argparse
+import os
+import sys
+import requests
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
+
+class Game:
+    def __init__(
+        self,
+        name: str,
+        genre: Optional[str]=None,
+        year: Optional[str]=None,
+        platform: Optional[str]=None,
+        publisher: Optional[str]=None,
+        url: Optional[str]=None,
+        screens_url: Optional[str]=None,
+        *args,**kwargs
+    ):
+        self.name = name
+        self.genre = genre
+        self.year = year
+        self.platform = platform
+        self.publisher = publisher
+        self.url = url
+        self.screens_url = screens_url
+
+    def __repr__(self):
+        return '<{} {}>'.format(
+            self.__class__.__name__,
+            ', '.join('{}={}'.format(i,j) for i,j in self.__dict__.items())
+        )
+
+    @property
+    def gmfolder(self):
+        if 'name' in self.__dict__ and self.name:
+            return 'games/{}'.format(self.name.replace(' - ','-').replace(' ','_'))
+        return 'games/default'
+
+    def mkfold(self):
+        if not os.path.isdir(self.gmfolder):
+            os.makedirs(self.gmfolder)
+
+    def download_desc(self,session):
+        self.mkfold()
+        if os.path.isfile('{}/description.txt'.format(self.gmfolder)): return
+        res = session.get(self.url)
+        if not res: return
+        res = BeautifulSoup(res.content,'html5lib').find('div',id='reviewtext')
+        if not res: return
+        print('Writing description')
+        with open('{}/description.txt'.format(self.gmfolder),'w') as wf:
+            wf.write('{}\n'.format(res.text.lstrip().rstrip()))
+
+    def download_images(self,session):
+        self.mkfold()
+        if not self.screens_url: return False
+        res = session.get(self.screens_url)
+        if not res: return False
+        for i in BeautifulSoup(res.content,'html5lib').find_all('a',class_='gamescreens',title=True,href=True):
+            url = 'https://www.old-games.ru{}'.format(i.attrs['href'])
+            fpath = '{}/{}'.format(self.gmfolder,url[url.rindex('/')+1:])
+            if os.path.isfile(fpath):
+                continue
+            print('Downloading: {}'.format(url[url.rindex('/')+1:]))
+            img = session.get(url)
+            if not img:
+                continue
+            with open(fpath,'wb') as wf:
+                wf.write(img.content)
+        return True
+
+
+
+def mp_pagenums(res,cur_page: Optional[int]=1,cur_pages: Optional[int]=1):
+    pages = res.find('ul',class_='pager')
+    if not pages: return (cur_page,cur_pages)
+    current = pages.find('li',class_='page-current')
+    if current:
+        current = current.string
+        if current and current.isdigit() and int(current) > cur_page-2:
+            cur_page = int(current)
+    for i in pages.find_all('a',href=True):
+        if not i.string or not i.string.isdigit() or int(i.string) < cur_pages:
+            continue
+        cur_pages = int(i.string)
+    return (cur_page,cur_pages)
+
+def main_parser(content: str,cur_page: Optional[int]=1,cur_pages: Optional[int]=1):
+    soup = BeautifulSoup(content,'html5lib')
+    res = soup.find('div',class_='main').find('main',id='main')
+    if not res: return
+    cur_page,cur_pages = mp_pagenums(res,cur_page,cur_pages)
+    res = res.find('table',class_='listtable')
+    if not res: return
+    games_list = []
+    for i in res.find_all('tr',class_=lambda x : x and x.startswith('bgstripe'),id=lambda x : x and x.startswith('game')):
+        try:
+            attrs = {
+                'genre': '/catalog/?genre',
+                'year': '/catalog/?year',
+                'platform': '/catalog/?platform',
+                'publisher': '/catalog/?publisherCompany'
+            }
+            for j in attrs:
+                func = lambda x : x.name == 'td' and bool(x.find('a',title=True,href=lambda x : x.startswith(attrs[j])))
+                attrs[j] = i.find_all(lambda x : x.name == 'td' and bool(x.find('a',title=True,href=lambda x : x.startswith(attrs[j]))))[0].find('a',href=True,title=True).string
+            i = i.find('table',width=True)
+            j = i.find_all(lambda x : x.name == 'td' and bool(x.find('a',href=lambda x : x.startswith('/game/screenshots'))))
+            try:
+                attrs['screens_url'] = 'https://www.old-games.ru{}'.format(i.find_all(lambda x : x.name == 'td' and bool(x.find('a',href=lambda x : x.startswith('/game/screenshots'))))[0].find('a',href=True,title=True).attrs['href'])
+            except IndexError:
+                pass
+            i = i.find('td',align='left').find('a',href=True,title=True)
+            attrs['name'] = i.string
+            attrs['url'] = url='https://www.old-games.ru{}'.format(i.attrs['href'])
+            if attrs['year'] and attrs['year'].isdigit():
+                attrs['year'] = int(attrs['year'])
+            else:
+                attrs['year'] = None
+            games_list.append(Game(**attrs))
+        except AttributeError:
+            print('Unexpected parsing error',file=sys.stderr)
+            continue
+    return (cur_page,cur_pages,games_list)
+
+def check_url(url: str):
+    try:
+        urlparse(url)
+    except:
+        return False
+    if not url.startswith('https://'):
+        return False
+    return True
+
+def args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('page_url',help='Url of old-games.ru page without ?page')
+    parser.add_argument('-g','--genre',metavar='genre',help="Restrict games to [genre]")
+    parser.add_argument('-y','--year',metavar='year',type=int,help="Restrict games publication to [year]")
+    parser.add_argument('-p','--platform',metavar='platform',type=int,help="Restrict games publication to [platform]")
+    parser.add_argument('-pp','--publisher',metavar='publisher',type=int,help="Restrict games publication to [publisher]")
+    args = parser.parse_args()
+    if not check_url(args.page_url):
+        print('Wrong url format')
+        exit(1)
+    if not args.page_url.startswith('https://www.old-games.ru'):
+        print('Wrong website')
+        exit(1)
+    return args.page_url,{i:k for i,k in args.__dict__.items() if i != 'page_url'}
+
+def _main():
+    page_url,chk_list = args()
+    session = requests.Session()
+    cur_pages = 1
+    cur_page = 1
+    while True:
+        print('++ page: {}'.format(cur_page))
+        res = session.get('{}{}'.format(
+            page_url,
+            '&page={}'.format(cur_page) if cur_page > 1 else ''
+        ))
+        cur_page,cur_pages,games = main_parser(res.content)
+        for game in games:
+            if not all(chk_list[i] == None or str(chk_list[i]).lower() == str(getattr(game,i)).lower() for i in chk_list):
+                continue
+            print(game.name)
+            game.download_desc(session)
+            if not game.download_images(session):
+                print('No thumbnails found')
+        cur_page+=1
+        if cur_page > cur_pages:
+            break
+
+def main():
+    try:
+        _main()
+    except KeyboardInterrupt:
+        return
+
+main()
